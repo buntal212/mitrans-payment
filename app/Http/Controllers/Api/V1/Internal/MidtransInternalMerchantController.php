@@ -305,8 +305,8 @@ class MidtransInternalMerchantController extends Controller
         $validated = $request->validate([
             'order_id' => ['nullable', 'string', 'max:100'],
             'amount' => ['required', 'numeric', 'min:1000'],
-            'payment_type' => ['nullable', 'string', 'in:qris,bank_transfer,gopay'],
-            'bank' => ['nullable', 'string', 'in:bca,bni,bri,permata'],
+            'payment_type' => ['nullable', 'string', 'in:qris,bank_transfer,echannel,gopay'],
+            'bank' => ['nullable', 'string', 'in:bca,bni,bri,permata,mandiri'],
         ]);
 
         $orderId = ! empty($validated['order_id'])
@@ -315,7 +315,7 @@ class MidtransInternalMerchantController extends Controller
 
         $amount = (float) $validated['amount'];
         $paymentType = $validated['payment_type'] ?? 'qris';
-        $bank = $validated['bank'] ?? 'bca';
+        $bank = strtolower((string) ($validated['bank'] ?? 'bca'));
 
         // Build Midtrans charge payload
         $payload = [
@@ -335,11 +335,22 @@ class MidtransInternalMerchantController extends Controller
         if ($paymentType === 'qris') {
             $payload['qris'] = ['acquirer' => 'gopay'];
         } elseif ($paymentType === 'bank_transfer') {
-            if ($bank === 'permata') {
+            if ($bank === 'mandiri') {
+                $payload['payment_type'] = 'echannel';
+                $payload['echannel'] = [
+                    'bill_info1' => 'Payment For:',
+                    'bill_info2' => 'UDEV Sandbox',
+                ];
+            } elseif ($bank === 'permata') {
                 $payload['bank_transfer'] = ['bank' => 'permata'];
             } else {
                 $payload['bank_transfer'] = ['bank' => $bank];
             }
+        } elseif ($paymentType === 'echannel') {
+            $payload['echannel'] = [
+                'bill_info1' => 'Payment For:',
+                'bill_info2' => 'UDEV Sandbox',
+            ];
         } elseif ($paymentType === 'gopay') {
             $payload['gopay'] = [
                 'enable_callback' => true,
@@ -355,15 +366,18 @@ class MidtransInternalMerchantController extends Controller
         $statusCode = (int) $result['status_code'];
         $isSuccess = ($statusCode >= 200 && $statusCode < 300) || ($body['status_code'] ?? '') === '201';
 
-        // Extract QR string or VA numbers
+        // Extract QR string, VA numbers, or Mandiri bill codes
         $qrString = null;
         $checkoutUrl = null;
         $vaNumbers = null;
+        $permataVaNumber = $body['permata_va_number'] ?? null;
+        $billKey = $body['bill_key'] ?? null;
+        $billerCode = $body['biller_code'] ?? null;
 
         if (! empty($body['actions'])) {
             foreach ($body['actions'] as $action) {
-                if (($action['name'] ?? '') === 'generate-qr-code') {
-                    $checkoutUrl = $action['url'] ?? null;
+                if (($action['name'] ?? '') === 'generate-qr-code' || ($action['name'] ?? '') === 'deeplink-redirect') {
+                    $checkoutUrl = $action['url'] ?? $checkoutUrl;
                 }
             }
         }
@@ -372,8 +386,10 @@ class MidtransInternalMerchantController extends Controller
         }
         if (! empty($body['va_numbers'])) {
             $vaNumbers = $body['va_numbers'];
-        } elseif (! empty($body['permata_va_number'])) {
-            $vaNumbers = [['bank' => 'permata', 'va_number' => $body['permata_va_number']]];
+        } elseif (! empty($permataVaNumber)) {
+            $vaNumbers = [['bank' => 'permata', 'va_number' => $permataVaNumber]];
+        } elseif (! empty($billKey)) {
+            $vaNumbers = [['bank' => 'mandiri', 'va_number' => $billKey, 'biller_code' => $billerCode]];
         }
 
         // Store payment record locally
@@ -383,7 +399,7 @@ class MidtransInternalMerchantController extends Controller
             'midtrans_transaction_id' => $body['transaction_id'] ?? null,
             'gross_amount' => $amount,
             'currency' => 'IDR',
-            'payment_type' => $paymentType,
+            'payment_type' => $body['payment_type'] ?? $paymentType,
             'transaction_status' => $body['transaction_status'] ?? 'pending',
             'fraud_status' => $body['fraud_status'] ?? 'accept',
             'status_code' => $body['status_code'] ?? (string) $statusCode,
@@ -395,6 +411,10 @@ class MidtransInternalMerchantController extends Controller
             'metadata' => [
                 'test_run' => true,
                 'environment' => $merchant->environment,
+                'bank' => $bank,
+                'permata_va_number' => $permataVaNumber,
+                'bill_key' => $billKey,
+                'biller_code' => $billerCode,
             ],
         ]);
 
@@ -407,8 +427,12 @@ class MidtransInternalMerchantController extends Controller
             metadata: [
                 'order_id' => $orderId,
                 'gross_amount' => $amount,
-                'payment_type' => $paymentType,
+                'payment_type' => $body['payment_type'] ?? $paymentType,
+                'bank' => $bank,
                 'transaction_id' => $body['transaction_id'] ?? null,
+                'va_numbers' => $vaNumbers,
+                'bill_key' => $billKey,
+                'biller_code' => $billerCode,
             ]
         );
 
@@ -420,11 +444,15 @@ class MidtransInternalMerchantController extends Controller
                 'order_id' => $orderId,
                 'transaction_id' => $body['transaction_id'] ?? null,
                 'gross_amount' => $amount,
-                'payment_type' => $paymentType,
+                'payment_type' => $body['payment_type'] ?? $paymentType,
+                'bank' => $bank,
                 'transaction_status' => $payment->transaction_status,
                 'qr_string' => $qrString,
                 'checkout_url' => $checkoutUrl,
                 'va_numbers' => $vaNumbers,
+                'permata_va_number' => $permataVaNumber,
+                'bill_key' => $billKey,
+                'biller_code' => $billerCode,
                 'raw_response' => $body,
                 'created_at' => $payment->created_at->format('Y-m-d H:i:s'),
             ],

@@ -46,6 +46,7 @@ class PaymentController extends Controller
             'currency' => ['nullable', 'string', 'in:IDR'],
             'merchant_code' => ['nullable', 'string'],
             'payment_type' => ['nullable', 'string'],
+            'bank' => ['nullable', 'string', 'in:bca,bni,bri,permata,mandiri'],
             'metadata' => ['nullable', 'array'],
         ]);
 
@@ -64,6 +65,7 @@ class PaymentController extends Controller
 
         $orderId = $validated['merchant_order_id'];
         $paymentType = $validated['payment_type'] ?? 'qris';
+        $bank = strtolower((string) ($validated['bank'] ?? ($validated['metadata']['bank'] ?? 'bca')));
 
         // Check if payment already exists (Idempotency)
         $existing = Payment::query()
@@ -103,6 +105,28 @@ class PaymentController extends Controller
 
             if ($paymentType === 'qris') {
                 $payload['qris'] = ['acquirer' => 'gopay'];
+            } elseif ($paymentType === 'bank_transfer') {
+                if ($bank === 'mandiri') {
+                    $payload['payment_type'] = 'echannel';
+                    $payload['echannel'] = [
+                        'bill_info1' => 'Payment For:',
+                        'bill_info2' => 'UDEV Invoice',
+                    ];
+                } elseif ($bank === 'permata') {
+                    $payload['bank_transfer'] = ['bank' => 'permata'];
+                } else {
+                    $payload['bank_transfer'] = ['bank' => $bank];
+                }
+            } elseif ($paymentType === 'echannel') {
+                $payload['echannel'] = [
+                    'bill_info1' => 'Payment For:',
+                    'bill_info2' => 'UDEV Invoice',
+                ];
+            } elseif ($paymentType === 'gopay') {
+                $payload['gopay'] = [
+                    'enable_callback' => true,
+                    'callback_url' => 'https://udev.udumbara.my.id/payment-result',
+                ];
             }
 
             $res = $this->apiClient->charge($serverKey, $payload, $merchant->environment);
@@ -112,8 +136,8 @@ class PaymentController extends Controller
 
             if (! empty($rawResponse['actions'])) {
                 foreach ($rawResponse['actions'] as $action) {
-                    if (($action['name'] ?? '') === 'generate-qr-code') {
-                        $checkoutUrl = $action['url'] ?? null;
+                    if (($action['name'] ?? '') === 'generate-qr-code' || ($action['name'] ?? '') === 'deeplink-redirect') {
+                        $checkoutUrl = $action['url'] ?? $checkoutUrl;
                     }
                 }
             }
@@ -122,6 +146,10 @@ class PaymentController extends Controller
             }
             if (! empty($rawResponse['va_numbers'])) {
                 $vaNumbers = $rawResponse['va_numbers'];
+            } elseif (! empty($rawResponse['permata_va_number'])) {
+                $vaNumbers = [['bank' => 'permata', 'va_number' => $rawResponse['permata_va_number']]];
+            } elseif (! empty($rawResponse['bill_key'])) {
+                $vaNumbers = [['bank' => 'mandiri', 'va_number' => $rawResponse['bill_key'], 'biller_code' => $rawResponse['biller_code'] ?? null]];
             }
         }
 
@@ -131,7 +159,7 @@ class PaymentController extends Controller
             'midtrans_transaction_id' => $transactionId,
             'gross_amount' => $grossAmount,
             'currency' => 'IDR',
-            'payment_type' => $paymentType,
+            'payment_type' => $rawResponse['payment_type'] ?? $paymentType,
             'transaction_status' => $rawResponse['transaction_status'] ?? 'pending',
             'fraud_status' => $rawResponse['fraud_status'] ?? 'accept',
             'status_code' => $statusCode,
@@ -140,7 +168,7 @@ class PaymentController extends Controller
             'qr_string' => $qrString,
             'va_numbers' => $vaNumbers,
             'raw_response' => $rawResponse,
-            'metadata' => $validated['metadata'] ?? [],
+            'metadata' => array_merge($validated['metadata'] ?? [], ['bank' => $bank]),
         ]);
 
         $this->auditService->record(
@@ -204,6 +232,9 @@ class PaymentController extends Controller
             'checkout_url' => $payment->checkout_url,
             'qr_string' => $payment->qr_string,
             'va_numbers' => $payment->va_numbers,
+            'permata_va_number' => $payment->raw_response['permata_va_number'] ?? null,
+            'bill_key' => $payment->raw_response['bill_key'] ?? null,
+            'biller_code' => $payment->raw_response['biller_code'] ?? null,
             'metadata' => $payment->metadata,
             'paid_at' => $payment->paid_at?->format('Y-m-d H:i:s'),
             'created_at' => $payment->created_at?->format('Y-m-d H:i:s'),
