@@ -139,6 +139,20 @@ class MidtransWebhookController extends Controller
             ]
         );
 
+        // Forward verified webhook to UDEV billing if configured
+        $billingWebhookUrl = config('services.udev_billing.webhook_url');
+        $billingServiceToken = config('services.udev_billing.service_token');
+        if (! empty($billingWebhookUrl)) {
+            try {
+                \Illuminate\Support\Facades\Http::timeout((int) config('services.udev_billing.timeout', 5))
+                    ->withToken($billingServiceToken)
+                    ->acceptJson()
+                    ->post($billingWebhookUrl, $payload);
+            } catch (\Throwable) {
+                // Ignore transient billing webhook delivery issues so local processing completes
+            }
+        }
+
         return response()->json([
             'status' => 'OK',
             'message' => 'Webhook berhasil diproses.',

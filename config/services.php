@@ -59,4 +59,10 @@ return [
         ],
     ],
 
+    'udev_billing' => [
+        'webhook_url' => env('UDEV_BILLING_MIDTRANS_WEBHOOK_URL', 'http://127.0.0.1:8000/api/v1/payment-gateways/midtrans/webhook'),
+        'service_token' => env('MIDTRANS_GATEWAY_SERVICE_TOKEN', env('UDEV_INTERNAL_SERVICE_TOKEN', 'midtrans_service_secret_token_sandbox_64chars_key')),
+        'timeout' => 5,
+    ],
+
 ];
