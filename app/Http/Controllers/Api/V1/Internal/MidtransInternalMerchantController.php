@@ -445,6 +445,7 @@ class MidtransInternalMerchantController extends Controller
         $permataVaNumber = $body['permata_va_number'] ?? null;
         $billKey = $body['bill_key'] ?? null;
         $billerCode = $body['biller_code'] ?? null;
+        $expiryTime = $body['expiry_time'] ?? null;
 
         if (! empty($body['actions'])) {
             foreach ($body['actions'] as $action) {
@@ -496,6 +497,8 @@ class MidtransInternalMerchantController extends Controller
                     'environment' => $merchant->environment,
                     'bank' => $bank,
                     'qr_url' => $qrUrl,
+                    'expiry_time' => $expiryTime,
+                    'expires_at' => $expiryTime,
                     'permata_va_number' => $permataVaNumber,
                     'bill_key' => $billKey,
                     'biller_code' => $billerCode,
@@ -516,6 +519,7 @@ class MidtransInternalMerchantController extends Controller
                 'bank' => $bank,
                 'transaction_id' => $body['transaction_id'] ?? null,
                 'qr_url' => $qrUrl,
+                'expiry_time' => $expiryTime,
                 'va_numbers' => $vaNumbers,
                 'bill_key' => $billKey,
                 'biller_code' => $billerCode,
@@ -536,6 +540,8 @@ class MidtransInternalMerchantController extends Controller
                 'qr_string' => $qrString,
                 'qr_url' => $qrUrl,
                 'checkout_url' => $checkoutUrl,
+                'expiry_time' => $expiryTime,
+                'expires_at' => $expiryTime,
                 'va_numbers' => $vaNumbers,
                 'permata_va_number' => $permataVaNumber,
                 'bill_key' => $billKey,
@@ -655,6 +661,7 @@ class MidtransInternalMerchantController extends Controller
         $qrString = $payment?->qr_string ?? ($body['qr_string'] ?? ($body['qr_code'] ?? null));
         $checkoutUrl = $payment?->checkout_url ?? $qrUrl;
         $vaNumbers = $payment?->va_numbers ?? ($body['va_numbers'] ?? null);
+        $expiryTime = $body['expiry_time'] ?? ($payment?->raw_response['expiry_time'] ?? ($payment?->metadata['expiry_time'] ?? null));
 
         return response()->json([
             'status' => $isSuccess ? 'success' : 'failed',
@@ -670,6 +677,8 @@ class MidtransInternalMerchantController extends Controller
                 'qr_string' => $qrString,
                 'qr_url' => $qrUrl,
                 'checkout_url' => $checkoutUrl,
+                'expiry_time' => $expiryTime,
+                'expires_at' => $expiryTime,
                 'va_numbers' => $vaNumbers,
                 'permata_va_number' => $payment?->metadata['permata_va_number'] ?? ($body['permata_va_number'] ?? null),
                 'bill_key' => $payment?->metadata['bill_key'] ?? ($body['bill_key'] ?? null),

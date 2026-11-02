@@ -256,10 +256,13 @@ class PaymentController extends Controller
             $qrUrl = $payment->checkout_url;
         }
 
+        $expiryTime = $payment->raw_response['expiry_time'] ?? ($payment->metadata['expiry_time'] ?? null);
+
         return [
             'id' => $payment->id,
             'merchant_order_id' => $payment->merchant_order_id,
             'midtrans_transaction_id' => $payment->midtrans_transaction_id,
+            'transaction_id' => $payment->midtrans_transaction_id,
             'gross_amount' => $payment->gross_amount,
             'amount_minor' => (int) round($payment->gross_amount),
             'currency' => $payment->currency,
@@ -270,6 +273,8 @@ class PaymentController extends Controller
             'checkout_url' => $payment->checkout_url,
             'qr_string' => $payment->qr_string,
             'qr_url' => $qrUrl,
+            'expiry_time' => $expiryTime,
+            'expires_at' => $expiryTime,
             'va_numbers' => $payment->va_numbers,
             'permata_va_number' => $payment->raw_response['permata_va_number'] ?? null,
             'bill_key' => $payment->raw_response['bill_key'] ?? null,
