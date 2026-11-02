@@ -130,19 +130,36 @@ class PaymentController extends Controller
             }
 
             $res = $this->apiClient->charge($serverKey, $payload, $merchant->environment);
-            $rawResponse = $res['body'];
+            $rawResponse = $res['body'] ?? [];
             $transactionId = $rawResponse['transaction_id'] ?? null;
             $statusCode = $rawResponse['status_code'] ?? (string) $res['status_code'];
 
+            if ($statusCode === '406' || ($rawResponse['status_code'] ?? '') === '406' || $res['status_code'] === 406) {
+                $statusRes = $this->apiClient->checkStatus($serverKey, $orderId, $merchant->environment);
+                if ($statusRes['successful'] && ! empty($statusRes['body']['transaction_status'])) {
+                    $rawResponse = $statusRes['body'];
+                    $transactionId = $rawResponse['transaction_id'] ?? $transactionId;
+                    $statusCode = $rawResponse['status_code'] ?? (string) $statusRes['status_code'];
+                }
+            }
+
+            $qrUrl = null;
             if (! empty($rawResponse['actions'])) {
                 foreach ($rawResponse['actions'] as $action) {
-                    if (($action['name'] ?? '') === 'generate-qr-code' || ($action['name'] ?? '') === 'deeplink-redirect') {
+                    if (($action['name'] ?? '') === 'generate-qr-code') {
+                        $qrUrl = $action['url'] ?? null;
+                        $checkoutUrl = $action['url'] ?? $checkoutUrl;
+                    } elseif (($action['name'] ?? '') === 'deeplink-redirect') {
                         $checkoutUrl = $action['url'] ?? $checkoutUrl;
                     }
                 }
             }
             if (! empty($rawResponse['qr_string'])) {
                 $qrString = $rawResponse['qr_string'];
+            }
+            if ($paymentType === 'qris' && empty($qrUrl) && ! empty($transactionId)) {
+                $qrUrl = "https://api.".($merchant->environment === 'production' ? '' : 'sandbox.')."midtrans.com/v2/qris/{$transactionId}/qr-code";
+                $checkoutUrl = $checkoutUrl ?: $qrUrl;
             }
             if (! empty($rawResponse['va_numbers'])) {
                 $vaNumbers = $rawResponse['va_numbers'];
@@ -153,23 +170,27 @@ class PaymentController extends Controller
             }
         }
 
-        $payment = Payment::create([
-            'merchant_id' => $merchant->id,
-            'merchant_order_id' => $orderId,
-            'midtrans_transaction_id' => $transactionId,
-            'gross_amount' => $grossAmount,
-            'currency' => 'IDR',
-            'payment_type' => $rawResponse['payment_type'] ?? $paymentType,
-            'transaction_status' => $rawResponse['transaction_status'] ?? 'pending',
-            'fraud_status' => $rawResponse['fraud_status'] ?? 'accept',
-            'status_code' => $statusCode,
-            'status_message' => $rawResponse['status_message'] ?? null,
-            'checkout_url' => $checkoutUrl,
-            'qr_string' => $qrString,
-            'va_numbers' => $vaNumbers,
-            'raw_response' => $rawResponse,
-            'metadata' => array_merge($validated['metadata'] ?? [], ['bank' => $bank]),
-        ]);
+        $payment = Payment::updateOrCreate(
+            [
+                'merchant_id' => $merchant->id,
+                'merchant_order_id' => $orderId,
+            ],
+            [
+                'midtrans_transaction_id' => $transactionId,
+                'gross_amount' => $grossAmount,
+                'currency' => 'IDR',
+                'payment_type' => $rawResponse['payment_type'] ?? $paymentType,
+                'transaction_status' => $rawResponse['transaction_status'] ?? 'pending',
+                'fraud_status' => $rawResponse['fraud_status'] ?? 'accept',
+                'status_code' => $statusCode,
+                'status_message' => $rawResponse['status_message'] ?? null,
+                'checkout_url' => $checkoutUrl,
+                'qr_string' => $qrString,
+                'va_numbers' => $vaNumbers,
+                'raw_response' => $rawResponse,
+                'metadata' => array_merge($validated['metadata'] ?? [], ['bank' => $bank, 'qr_url' => $qrUrl ?? null]),
+            ]
+        );
 
         $this->auditService->record(
             action: 'payment.created',
@@ -218,6 +239,23 @@ class PaymentController extends Controller
 
     private function transformPayment(Payment $payment): array
     {
+        $qrUrl = $payment->metadata['qr_url'] ?? null;
+        if (empty($qrUrl) && ! empty($payment->raw_response['actions'])) {
+            foreach ($payment->raw_response['actions'] as $action) {
+                if (($action['name'] ?? '') === 'generate-qr-code') {
+                    $qrUrl = $action['url'] ?? null;
+                    break;
+                }
+            }
+        }
+        if (empty($qrUrl) && $payment->payment_type === 'qris' && ! empty($payment->midtrans_transaction_id)) {
+            $env = $payment->merchant?->environment ?? 'sandbox';
+            $qrUrl = "https://api.".($env === 'production' ? '' : 'sandbox.')."midtrans.com/v2/qris/{$payment->midtrans_transaction_id}/qr-code";
+        }
+        if (empty($qrUrl) && ! empty($payment->checkout_url) && str_contains((string) $payment->checkout_url, 'qr')) {
+            $qrUrl = $payment->checkout_url;
+        }
+
         return [
             'id' => $payment->id,
             'merchant_order_id' => $payment->merchant_order_id,
@@ -231,6 +269,7 @@ class PaymentController extends Controller
             'status_code' => $payment->status_code,
             'checkout_url' => $payment->checkout_url,
             'qr_string' => $payment->qr_string,
+            'qr_url' => $qrUrl,
             'va_numbers' => $payment->va_numbers,
             'permata_va_number' => $payment->raw_response['permata_va_number'] ?? null,
             'bill_key' => $payment->raw_response['bill_key'] ?? null,

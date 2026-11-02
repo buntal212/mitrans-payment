@@ -539,4 +539,128 @@ class MidtransGatewayTest extends TestCase
         $res->assertStatus(422)
             ->assertJsonValidationErrors(['bank']);
     }
+
+    public function test_sandbox_charge_recovers_from_duplicate_order_406(): void
+    {
+        $merchant = Merchant::create([
+            'merchant_code' => 'qris-recovery-merchant',
+            'merchant_name' => 'QRIS Recovery Merchant',
+            'environment' => 'sandbox',
+            'is_active' => true,
+        ]);
+        $config = $merchant->configuration()->create(['is_active' => true]);
+        $config->setServerKeyAttribute('SB-Mid-server-recovery123');
+        $config->save();
+
+        \Illuminate\Support\Facades\Http::fake([
+            'https://api.sandbox.midtrans.com/v2/charge' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '406',
+                'status_message' => 'Midtrans API is returning API error. Order ID has already been utilized.',
+            ], 406),
+            'https://api.sandbox.midtrans.com/v2/TEST-QRIS-DUP/status' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '201',
+                'status_message' => 'Success, transaction found',
+                'transaction_id' => 'tx-recovered-001',
+                'order_id' => 'TEST-QRIS-DUP',
+                'gross_amount' => '15000.00',
+                'payment_type' => 'qris',
+                'transaction_status' => 'pending',
+                'actions' => [
+                    ['name' => 'generate-qr-code', 'url' => 'https://api.sandbox.midtrans.com/v2/qris/tx-recovered-001/qr-code'],
+                ],
+                'qr_string' => '00020101021226680016ID.CO.SHOPEE.WWW.RECOVERED',
+            ], 200),
+        ]);
+
+        $res = $this->withToken($this->internalToken)
+            ->postJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/charge", [
+                'order_id' => 'TEST-QRIS-DUP',
+                'amount' => 15000,
+                'payment_type' => 'qris',
+            ]);
+
+        $res->assertStatus(201)
+            ->assertJsonPath('status', 'success')
+            ->assertJsonPath('data.order_id', 'TEST-QRIS-DUP')
+            ->assertJsonPath('data.transaction_id', 'tx-recovered-001')
+            ->assertJsonPath('data.qr_string', '00020101021226680016ID.CO.SHOPEE.WWW.RECOVERED')
+            ->assertJsonPath('data.checkout_url', 'https://api.sandbox.midtrans.com/v2/qris/tx-recovered-001/qr-code');
+
+        // Second call should return idempotent existing payment
+        $res2 = $this->withToken($this->internalToken)
+            ->postJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/charge", [
+                'order_id' => 'TEST-QRIS-DUP',
+                'amount' => 15000,
+                'payment_type' => 'qris',
+            ]);
+
+        $res2->assertStatus(200)
+            ->assertJsonPath('status', 'success')
+            ->assertJsonPath('data.order_id', 'TEST-QRIS-DUP')
+            ->assertJsonPath('data.transaction_id', 'tx-recovered-001')
+            ->assertJsonPath('data.qr_url', 'https://api.sandbox.midtrans.com/v2/qris/tx-recovered-001/qr-code');
+    }
+
+    public function test_query_sandbox_payment_status_returns_404_when_not_found(): void
+    {
+        $merchant = Merchant::create([
+            'merchant_code' => 'qris-notfound-merchant',
+            'merchant_name' => 'QRIS NotFound Merchant',
+            'environment' => 'sandbox',
+            'is_active' => true,
+        ]);
+        $config = $merchant->configuration()->create(['is_active' => true]);
+        $config->setServerKeyAttribute('SB-Mid-server-nf123');
+        $config->save();
+
+        \Illuminate\Support\Facades\Http::fake([
+            'https://api.sandbox.midtrans.com/v2/ORDER-NOT-FOUND/status' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '404',
+                'status_message' => 'Transaction doesn\'t exist.',
+            ], 404),
+        ]);
+
+        $res = $this->withToken($this->internalToken)
+            ->getJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/status/ORDER-NOT-FOUND");
+
+        $res->assertStatus(404)
+            ->assertJsonPath('status', 'failed')
+            ->assertJsonPath('is_not_found', true)
+            ->assertJsonPath('http_status', 404);
+    }
+
+    public function test_query_sandbox_payment_status_returns_qr_url_for_qris(): void
+    {
+        $merchant = Merchant::create([
+            'merchant_code' => 'qris-status-merchant',
+            'merchant_name' => 'QRIS Status Merchant',
+            'environment' => 'sandbox',
+            'is_active' => true,
+        ]);
+        $config = $merchant->configuration()->create(['is_active' => true]);
+        $config->setServerKeyAttribute('SB-Mid-server-st123');
+        $config->save();
+
+        \Illuminate\Support\Facades\Http::fake([
+            'https://api.sandbox.midtrans.com/v2/ORDER-QRIS-STATUS/status' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '201',
+                'status_message' => 'Success, transaction found',
+                'transaction_id' => 'tx-qris-status-999',
+                'order_id' => 'ORDER-QRIS-STATUS',
+                'gross_amount' => '25000.00',
+                'payment_type' => 'qris',
+                'transaction_status' => 'pending',
+            ], 200),
+        ]);
+
+        $res = $this->withToken($this->internalToken)
+            ->getJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/status/ORDER-QRIS-STATUS");
+
+        $res->assertStatus(200)
+            ->assertJsonPath('status', 'success')
+            ->assertJsonPath('data.order_id', 'ORDER-QRIS-STATUS')
+            ->assertJsonPath('data.transaction_id', 'tx-qris-status-999')
+            ->assertJsonPath('data.qr_url', 'https://api.sandbox.midtrans.com/v2/qris/tx-qris-status-999/qr-code')
+            ->assertJsonPath('data.checkout_url', 'https://api.sandbox.midtrans.com/v2/qris/tx-qris-status-999/qr-code');
+    }
 }

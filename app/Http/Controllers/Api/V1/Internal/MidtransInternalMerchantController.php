@@ -317,6 +317,63 @@ class MidtransInternalMerchantController extends Controller
         $paymentType = $validated['payment_type'] ?? 'qris';
         $bank = strtolower((string) ($validated['bank'] ?? 'bca'));
 
+        // Idempotency: return existing active pending payment if instruction is already complete
+        $existing = Payment::query()
+            ->where('merchant_id', $merchant->id)
+            ->where('merchant_order_id', $orderId)
+            ->first();
+
+        $existingQrUrl = $existing?->metadata['qr_url'] ?? null;
+        if (empty($existingQrUrl) && $existing?->payment_type === 'qris' && ! empty($existing?->midtrans_transaction_id)) {
+            $existingQrUrl = "https://api.".($merchant->environment === 'production' ? '' : 'sandbox.')."midtrans.com/v2/qris/{$existing->midtrans_transaction_id}/qr-code";
+        }
+
+        $hasExistingInstructions = $existing !== null && (
+            ! empty($existing->qr_string)
+            || ! empty($existing->checkout_url)
+            || ! empty($existing->va_numbers)
+            || ! empty($existingQrUrl)
+        );
+
+        if ($hasExistingInstructions && $existing->transaction_status === 'pending') {
+            $qrUrl = $existingQrUrl;
+            if (! empty($existing->raw_response['actions'])) {
+                foreach ($existing->raw_response['actions'] as $action) {
+                    if (($action['name'] ?? '') === 'generate-qr-code') {
+                        $qrUrl = $action['url'] ?? null;
+                        break;
+                    }
+                }
+            }
+            if (empty($qrUrl) && $existing->payment_type === 'qris' && ! empty($existing->midtrans_transaction_id)) {
+                $qrUrl = "https://api.".($merchant->environment === 'production' ? '' : 'sandbox.')."midtrans.com/v2/qris/{$existing->midtrans_transaction_id}/qr-code";
+            }
+            $effectiveCheckoutUrl = $existing->checkout_url ?: $qrUrl;
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Transaksi sandbox sudah terdaftar sebelumnya (Idempoten).',
+                'data' => [
+                    'id' => $existing->id,
+                    'order_id' => $existing->merchant_order_id,
+                    'transaction_id' => $existing->midtrans_transaction_id,
+                    'gross_amount' => (float) $existing->gross_amount,
+                    'payment_type' => $existing->payment_type,
+                    'bank' => $existing->metadata['bank'] ?? $bank,
+                    'transaction_status' => $existing->transaction_status,
+                    'qr_string' => $existing->qr_string,
+                    'qr_url' => $qrUrl,
+                    'checkout_url' => $effectiveCheckoutUrl,
+                    'va_numbers' => $existing->va_numbers,
+                    'permata_va_number' => $existing->metadata['permata_va_number'] ?? null,
+                    'bill_key' => $existing->metadata['bill_key'] ?? null,
+                    'biller_code' => $existing->metadata['biller_code'] ?? null,
+                    'raw_response' => $existing->raw_response,
+                    'created_at' => $existing->created_at->format('Y-m-d H:i:s'),
+                ],
+            ], Response::HTTP_OK);
+        }
+
         // Build Midtrans charge payload
         $payload = [
             'payment_type' => $paymentType,
@@ -362,13 +419,28 @@ class MidtransInternalMerchantController extends Controller
         $result = $this->apiClient->charge($serverKey, $payload, $merchant->environment);
         $latencyMs = (int) round((microtime(true) - $startTime) * 1000);
 
-        $body = $result['body'];
+        $body = $result['body'] ?? [];
         $statusCode = (int) $result['status_code'];
-        $isSuccess = ($statusCode >= 200 && $statusCode < 300) || ($body['status_code'] ?? '') === '201';
+        $midtransCode = (string) ($body['status_code'] ?? '');
 
-        // Extract QR string, VA numbers, or Mandiri bill codes
+        // If duplicate order ID (406), attempt recovery via Midtrans checkStatus
+        if ($statusCode === 406 || $midtransCode === '406') {
+            $statusRes = $this->apiClient->checkStatus($serverKey, $orderId, $merchant->environment);
+            if ($statusRes['successful'] && ! empty($statusRes['body']['transaction_status'])) {
+                $body = $statusRes['body'];
+                $statusCode = (int) $statusRes['status_code'];
+                $midtransCode = (string) ($body['status_code'] ?? '');
+            }
+        }
+
+        $isSuccess = in_array($midtransCode, ['200', '201'], true)
+            || ($statusCode === 201 && $midtransCode === '')
+            || ($statusCode >= 200 && $statusCode < 300 && in_array($body['transaction_status'] ?? '', ['pending', 'settlement', 'capture'], true));
+
+        // Extract QR string, QR URL, VA numbers, or Mandiri bill codes
         $qrString = null;
         $checkoutUrl = null;
+        $qrUrl = null;
         $vaNumbers = null;
         $permataVaNumber = $body['permata_va_number'] ?? null;
         $billKey = $body['bill_key'] ?? null;
@@ -376,7 +448,10 @@ class MidtransInternalMerchantController extends Controller
 
         if (! empty($body['actions'])) {
             foreach ($body['actions'] as $action) {
-                if (($action['name'] ?? '') === 'generate-qr-code' || ($action['name'] ?? '') === 'deeplink-redirect') {
+                if (($action['name'] ?? '') === 'generate-qr-code') {
+                    $qrUrl = $action['url'] ?? null;
+                    $checkoutUrl = $action['url'] ?? $checkoutUrl;
+                } elseif (($action['name'] ?? '') === 'deeplink-redirect') {
                     $checkoutUrl = $action['url'] ?? $checkoutUrl;
                 }
             }
@@ -384,6 +459,11 @@ class MidtransInternalMerchantController extends Controller
         if (! empty($body['qr_string'])) {
             $qrString = $body['qr_string'];
         }
+        if ($paymentType === 'qris' && empty($qrUrl) && ! empty($body['transaction_id'])) {
+            $qrUrl = "https://api.".($merchant->environment === 'production' ? '' : 'sandbox.')."midtrans.com/v2/qris/{$body['transaction_id']}/qr-code";
+            $checkoutUrl = $checkoutUrl ?: $qrUrl;
+        }
+
         if (! empty($body['va_numbers'])) {
             $vaNumbers = $body['va_numbers'];
         } elseif (! empty($permataVaNumber)) {
@@ -392,31 +472,36 @@ class MidtransInternalMerchantController extends Controller
             $vaNumbers = [['bank' => 'mandiri', 'va_number' => $billKey, 'biller_code' => $billerCode]];
         }
 
-        // Store payment record locally
-        $payment = Payment::create([
-            'merchant_id' => $merchant->id,
-            'merchant_order_id' => $orderId,
-            'midtrans_transaction_id' => $body['transaction_id'] ?? null,
-            'gross_amount' => $amount,
-            'currency' => 'IDR',
-            'payment_type' => $body['payment_type'] ?? $paymentType,
-            'transaction_status' => $body['transaction_status'] ?? 'pending',
-            'fraud_status' => $body['fraud_status'] ?? 'accept',
-            'status_code' => $body['status_code'] ?? (string) $statusCode,
-            'status_message' => $body['status_message'] ?? null,
-            'checkout_url' => $checkoutUrl,
-            'qr_string' => $qrString,
-            'va_numbers' => $vaNumbers,
-            'raw_response' => $body,
-            'metadata' => [
-                'test_run' => true,
-                'environment' => $merchant->environment,
-                'bank' => $bank,
-                'permata_va_number' => $permataVaNumber,
-                'bill_key' => $billKey,
-                'biller_code' => $billerCode,
+        // Store payment record locally using updateOrCreate to avoid unique constraint violations
+        $payment = Payment::updateOrCreate(
+            [
+                'merchant_id' => $merchant->id,
+                'merchant_order_id' => $orderId,
             ],
-        ]);
+            [
+                'midtrans_transaction_id' => $body['transaction_id'] ?? null,
+                'gross_amount' => $amount,
+                'currency' => 'IDR',
+                'payment_type' => $body['payment_type'] ?? $paymentType,
+                'transaction_status' => $body['transaction_status'] ?? ($isSuccess ? 'pending' : 'failed'),
+                'fraud_status' => $body['fraud_status'] ?? 'accept',
+                'status_code' => $body['status_code'] ?? (string) $statusCode,
+                'status_message' => $body['status_message'] ?? null,
+                'checkout_url' => $checkoutUrl,
+                'qr_string' => $qrString,
+                'va_numbers' => $vaNumbers,
+                'raw_response' => $body,
+                'metadata' => [
+                    'test_run' => true,
+                    'environment' => $merchant->environment,
+                    'bank' => $bank,
+                    'qr_url' => $qrUrl,
+                    'permata_va_number' => $permataVaNumber,
+                    'bill_key' => $billKey,
+                    'biller_code' => $billerCode,
+                ],
+            ]
+        );
 
         $this->auditService->record(
             action: 'sandbox.payment_created',
@@ -430,6 +515,7 @@ class MidtransInternalMerchantController extends Controller
                 'payment_type' => $body['payment_type'] ?? $paymentType,
                 'bank' => $bank,
                 'transaction_id' => $body['transaction_id'] ?? null,
+                'qr_url' => $qrUrl,
                 'va_numbers' => $vaNumbers,
                 'bill_key' => $billKey,
                 'biller_code' => $billerCode,
@@ -448,6 +534,7 @@ class MidtransInternalMerchantController extends Controller
                 'bank' => $bank,
                 'transaction_status' => $payment->transaction_status,
                 'qr_string' => $qrString,
+                'qr_url' => $qrUrl,
                 'checkout_url' => $checkoutUrl,
                 'va_numbers' => $vaNumbers,
                 'permata_va_number' => $permataVaNumber,
@@ -479,9 +566,10 @@ class MidtransInternalMerchantController extends Controller
         $result = $this->apiClient->checkStatus($serverKey, $orderId, $merchant->environment);
         $latencyMs = (int) round((microtime(true) - $startTime) * 1000);
 
-        $body = $result['body'];
+        $body = $result['body'] ?? [];
         $statusCode = (int) $result['status_code'];
-        $isSuccess = ($statusCode >= 200 && $statusCode < 300);
+        $isNotFound = $statusCode === 404 || ($body['status_code'] ?? '') === '404';
+        $isSuccess = ($statusCode >= 200 && $statusCode < 300) && ! $isNotFound;
 
         // Update local payment if found
         $payment = Payment::query()->where('merchant_id', $merchant->id)
@@ -499,6 +587,7 @@ class MidtransInternalMerchantController extends Controller
                     ? ($payment->paid_at ?? now())
                     : null,
             ]);
+            $payment = $payment->fresh();
         }
 
         $this->auditService->record(
@@ -510,18 +599,60 @@ class MidtransInternalMerchantController extends Controller
             metadata: ['order_id' => $orderId, 'transaction_status' => $body['transaction_status'] ?? null]
         );
 
+        if ($isNotFound) {
+            return response()->json([
+                'status' => 'failed',
+                'http_status' => 404,
+                'is_not_found' => true,
+                'message' => 'Transaksi tidak ditemukan di Midtrans Sandbox.',
+                'data' => [
+                    'order_id' => $orderId,
+                    'transaction_status' => 'not_found',
+                    'raw_response' => $body,
+                ],
+            ], Response::HTTP_NOT_FOUND);
+        }
+
+        $txId = $body['transaction_id'] ?? $payment?->midtrans_transaction_id;
+        $paymentType = $body['payment_type'] ?? $payment?->payment_type ?? 'qris';
+        $qrUrl = $payment?->metadata['qr_url'] ?? null;
+        if (empty($qrUrl) && ! empty($body['actions'])) {
+            foreach ($body['actions'] as $action) {
+                if (($action['name'] ?? '') === 'generate-qr-code') {
+                    $qrUrl = $action['url'] ?? null;
+                    break;
+                }
+            }
+        }
+        if (empty($qrUrl) && $paymentType === 'qris' && ! empty($txId)) {
+            $qrUrl = "https://api.".($merchant->environment === 'production' ? '' : 'sandbox.')."midtrans.com/v2/qris/{$txId}/qr-code";
+        }
+        $qrString = $payment?->qr_string ?? ($body['qr_string'] ?? ($body['qr_code'] ?? null));
+        $checkoutUrl = $payment?->checkout_url ?? $qrUrl;
+        $vaNumbers = $payment?->va_numbers ?? ($body['va_numbers'] ?? null);
+
         return response()->json([
             'status' => $isSuccess ? 'success' : 'failed',
+            'http_status' => $statusCode,
+            'is_not_found' => false,
             'data' => [
                 'order_id' => $orderId,
-                'transaction_status' => $body['transaction_status'] ?? 'unknown',
+                'transaction_id' => $txId,
+                'transaction_status' => $body['transaction_status'] ?? ($payment?->transaction_status ?? 'unknown'),
                 'status_message' => $body['status_message'] ?? null,
-                'gross_amount' => $body['gross_amount'] ?? null,
-                'payment_type' => $body['payment_type'] ?? null,
+                'gross_amount' => $body['gross_amount'] ?? $payment?->gross_amount,
+                'payment_type' => $paymentType,
+                'qr_string' => $qrString,
+                'qr_url' => $qrUrl,
+                'checkout_url' => $checkoutUrl,
+                'va_numbers' => $vaNumbers,
+                'permata_va_number' => $payment?->metadata['permata_va_number'] ?? ($body['permata_va_number'] ?? null),
+                'bill_key' => $payment?->metadata['bill_key'] ?? ($body['bill_key'] ?? null),
+                'biller_code' => $payment?->metadata['biller_code'] ?? ($body['biller_code'] ?? null),
                 'raw_response' => $body,
                 'payment' => $payment,
             ],
-        ]);
+        ], $isSuccess ? Response::HTTP_OK : Response::HTTP_BAD_REQUEST);
     }
 
     public function audits(Request $request, string $merchantCode): JsonResponse
