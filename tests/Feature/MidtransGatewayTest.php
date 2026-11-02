@@ -663,4 +663,44 @@ class MidtransGatewayTest extends TestCase
             ->assertJsonPath('data.qr_url', 'https://api.sandbox.midtrans.com/v2/qris/tx-qris-status-999/qr-code')
             ->assertJsonPath('data.checkout_url', 'https://api.sandbox.midtrans.com/v2/qris/tx-qris-status-999/qr-code');
     }
+
+    public function test_query_sandbox_payment_status_handles_expire_status_without_paid_at(): void
+    {
+        $merchant = Merchant::create([
+            'merchant_code' => 'expire-status-merchant',
+            'merchant_name' => 'Expire Status Merchant',
+            'environment' => 'sandbox',
+            'is_active' => true,
+        ]);
+        $config = $merchant->configuration()->create(['is_active' => true]);
+        $config->setServerKeyAttribute('SB-Mid-server-exp123');
+        $config->save();
+
+        $uuid = '13a03f8d-3450-4acc-b0d6-2382fab53613';
+        \Illuminate\Support\Facades\Http::fake([
+            'https://api.sandbox.midtrans.com/v2/INV-20261101-VDWNVAOGGV-A4/status' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '200',
+                'status_message' => 'Midtrans transaction is expired',
+                'transaction_id' => $uuid,
+                'order_id' => 'INV-20261101-VDWNVAOGGV-A4',
+                'gross_amount' => '50000.00',
+                'payment_type' => 'qris',
+                'transaction_status' => 'expire',
+            ], 200),
+        ]);
+
+        $res = $this->withToken($this->internalToken)
+            ->getJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/status/INV-20261101-VDWNVAOGGV-A4");
+
+        $res->assertStatus(200)
+            ->assertJsonPath('status', 'success')
+            ->assertJsonPath('data.order_id', 'INV-20261101-VDWNVAOGGV-A4')
+            ->assertJsonPath('data.transaction_id', $uuid)
+            ->assertJsonPath('data.transaction_status', 'expire');
+
+        $payment = Payment::query()->where('merchant_order_id', 'INV-20261101-VDWNVAOGGV-A4')->firstOrFail();
+        $this->assertSame($uuid, $payment->midtrans_transaction_id);
+        $this->assertSame('expire', $payment->transaction_status);
+        $this->assertNull($payment->paid_at);
+    }
 }

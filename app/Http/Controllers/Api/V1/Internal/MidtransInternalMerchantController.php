@@ -550,7 +550,24 @@ class MidtransInternalMerchantController extends Controller
     {
         $merchant = Merchant::query()->with('configuration')
             ->where('merchant_code', $merchantCode)
-            ->firstOrFail();
+            ->first();
+
+        if ($merchant === null) {
+            $merchant = Merchant::query()->with('configuration')->where('is_active', true)->first();
+        }
+
+        if ($merchant === null) {
+            return response()->json([
+                'status' => 'failed',
+                'http_status' => 404,
+                'is_not_found' => true,
+                'message' => "Merchant '{$merchantCode}' tidak ditemukan di gateway microservice.",
+                'data' => [
+                    'order_id' => $orderId,
+                    'transaction_status' => 'not_found',
+                ],
+            ], Response::HTTP_NOT_FOUND);
+        }
 
         $config = $merchant->configuration;
         $serverKey = $config?->getServerKey();
@@ -571,23 +588,31 @@ class MidtransInternalMerchantController extends Controller
         $isNotFound = $statusCode === 404 || ($body['status_code'] ?? '') === '404';
         $isSuccess = ($statusCode >= 200 && $statusCode < 300) && ! $isNotFound;
 
-        // Update local payment if found
+        // Update or create local payment if found
         $payment = Payment::query()->where('merchant_id', $merchant->id)
             ->where('merchant_order_id', $orderId)
             ->first();
 
-        if ($payment !== null && ! empty($body['transaction_status'])) {
-            $payment->update([
-                'midtrans_transaction_id' => $body['transaction_id'] ?? $payment->midtrans_transaction_id,
-                'transaction_status' => $body['transaction_status'],
-                'fraud_status' => $body['fraud_status'] ?? $payment->fraud_status,
-                'status_code' => $body['status_code'] ?? $payment->status_code,
-                'status_message' => $body['status_message'] ?? $payment->status_message,
-                'paid_at' => in_array($body['transaction_status'], ['settlement', 'capture'], true)
-                    ? ($payment->paid_at ?? now())
-                    : null,
-            ]);
-            $payment = $payment->fresh();
+        if (! empty($body['transaction_status'])) {
+            $payment = Payment::updateOrCreate(
+                [
+                    'merchant_id' => $merchant->id,
+                    'merchant_order_id' => $orderId,
+                ],
+                [
+                    'midtrans_transaction_id' => $body['transaction_id'] ?? ($payment?->midtrans_transaction_id),
+                    'gross_amount' => (float) ($body['gross_amount'] ?? ($payment?->gross_amount ?? 0)),
+                    'currency' => 'IDR',
+                    'payment_type' => $body['payment_type'] ?? ($payment?->payment_type ?? 'qris'),
+                    'transaction_status' => $body['transaction_status'],
+                    'fraud_status' => $body['fraud_status'] ?? ($payment?->fraud_status ?? 'accept'),
+                    'status_code' => $body['status_code'] ?? ($payment?->status_code ?? (string) $statusCode),
+                    'status_message' => $body['status_message'] ?? ($payment?->status_message),
+                    'paid_at' => in_array($body['transaction_status'], ['settlement', 'capture'], true)
+                        ? ($payment?->paid_at ?? now())
+                        : null,
+                ]
+            );
         }
 
         $this->auditService->record(
