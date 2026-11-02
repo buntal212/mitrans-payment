@@ -765,4 +765,33 @@ class MidtransGatewayTest extends TestCase
             ->assertJsonPath('data.expiry_time', '2026-11-02 22:02:43')
             ->assertJsonPath('data.expires_at', '2026-11-02T15:02:43+00:00');
     }
+
+    public function test_query_sandbox_payment_status_does_not_treat_auth_or_merchant_errors_as_order_not_found(): void
+    {
+        $merchant = Merchant::create([
+            'merchant_code' => 'auth-err-merchant',
+            'merchant_name' => 'Auth Error Merchant',
+            'environment' => 'sandbox',
+            'is_active' => true,
+        ]);
+        $config = $merchant->configuration()->create(['is_active' => true]);
+        $config->setServerKeyAttribute('SB-Mid-server-wrongkey');
+        $config->save();
+
+        // Simulate Midtrans 401 Unauthorized
+        \Illuminate\Support\Facades\Http::fake([
+            'https://api.sandbox.midtrans.com/v2/ORDER-AUTH-ERR/status' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '401',
+                'status_message' => 'Access denied due to unauthorized transaction, please check your server key',
+            ], 401),
+        ]);
+
+        $res = $this->withToken($this->internalToken)
+            ->getJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/status/ORDER-AUTH-ERR");
+
+        $res->assertStatus(401)
+            ->assertJsonPath('status', 'failed')
+            ->assertJsonPath('is_not_found', false)
+            ->assertJsonPath('error_type', 'gateway_authentication_failed');
+    }
 }

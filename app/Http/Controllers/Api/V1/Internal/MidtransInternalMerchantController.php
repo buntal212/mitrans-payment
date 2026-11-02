@@ -569,11 +569,12 @@ class MidtransInternalMerchantController extends Controller
             return response()->json([
                 'status' => 'failed',
                 'http_status' => 404,
-                'is_not_found' => true,
+                'is_not_found' => false,
+                'error_type' => 'merchant_not_found',
                 'message' => "Merchant '{$merchantCode}' tidak ditemukan di gateway microservice.",
                 'data' => [
                     'order_id' => $orderId,
-                    'transaction_status' => 'not_found',
+                    'transaction_status' => 'merchant_not_found',
                 ],
             ], Response::HTTP_NOT_FOUND);
         }
@@ -595,18 +596,51 @@ class MidtransInternalMerchantController extends Controller
         $body = $result['body'] ?? [];
         $statusCode = (int) $result['status_code'];
         $isNotFound = $statusCode === 404 || ($body['status_code'] ?? '') === '404';
-        $isSuccess = ($statusCode >= 200 && $statusCode < 300) && ! $isNotFound;
+
+        // If order not found, check if an alternate identifier (transaction_id vs merchant_order_id) exists locally
+        if ($isNotFound) {
+            $altPayment = Payment::query()->where('merchant_id', $merchant->id)
+                ->where(function ($q) use ($orderId): void {
+                    $q->where('merchant_order_id', $orderId)
+                        ->orWhere('midtrans_transaction_id', $orderId);
+                })
+                ->first();
+
+            $altId = $altPayment?->midtrans_transaction_id ?: $altPayment?->merchant_order_id;
+            if (! empty($altId) && $altId !== $orderId) {
+                $altResult = $this->apiClient->checkStatus($serverKey, $altId, $merchant->environment);
+                if ($altResult['successful'] && ! empty($altResult['body']['transaction_status'])) {
+                    $result = $altResult;
+                    $body = $result['body'];
+                    $statusCode = (int) $result['status_code'];
+                    $isNotFound = false;
+                }
+            }
+        }
+
+        $isAuthError = in_array($statusCode, [401, 403], true) || in_array($body['status_code'] ?? '', ['401', '403'], true);
+        $isNetworkTimeout = in_array($statusCode, [504, 502, 503], true) || in_array($body['status_code'] ?? '', ['504', '502', '503'], true);
+
+        if ($isAuthError || $isNetworkTimeout) {
+            $isNotFound = false;
+        }
+
+        $isSuccess = ($statusCode >= 200 && $statusCode < 300) && ! $isNotFound && ! $isAuthError;
 
         // Update or create local payment if found
         $payment = Payment::query()->where('merchant_id', $merchant->id)
-            ->where('merchant_order_id', $orderId)
+            ->where(function ($q) use ($orderId): void {
+                $q->where('merchant_order_id', $orderId)
+                    ->orWhere('midtrans_transaction_id', $orderId);
+            })
             ->first();
 
         if (! empty($body['transaction_status'])) {
+            $effectiveOrderId = $body['order_id'] ?? ($payment?->merchant_order_id ?? $orderId);
             $payment = Payment::updateOrCreate(
                 [
                     'merchant_id' => $merchant->id,
-                    'merchant_order_id' => $orderId,
+                    'merchant_order_id' => $effectiveOrderId,
                 ],
                 [
                     'midtrans_transaction_id' => $body['transaction_id'] ?? ($payment?->midtrans_transaction_id),
@@ -632,6 +666,36 @@ class MidtransInternalMerchantController extends Controller
             latencyMs: $latencyMs,
             metadata: ['order_id' => $orderId, 'transaction_status' => $body['transaction_status'] ?? null]
         );
+
+        if ($isAuthError) {
+            return response()->json([
+                'status' => 'failed',
+                'http_status' => Response::HTTP_UNAUTHORIZED,
+                'is_not_found' => false,
+                'error_type' => 'gateway_authentication_failed',
+                'message' => $body['status_message'] ?? 'Autentikasi Midtrans gagal. Periksa Server Key merchant.',
+                'data' => [
+                    'order_id' => $orderId,
+                    'transaction_status' => 'unauthorized',
+                    'raw_response' => $body,
+                ],
+            ], Response::HTTP_UNAUTHORIZED);
+        }
+
+        if ($isNetworkTimeout) {
+            return response()->json([
+                'status' => 'failed',
+                'http_status' => Response::HTTP_GATEWAY_TIMEOUT,
+                'is_not_found' => false,
+                'error_type' => 'gateway_timeout',
+                'message' => $body['status_message'] ?? 'Koneksi ke Midtrans API timeout.',
+                'data' => [
+                    'order_id' => $orderId,
+                    'transaction_status' => 'timeout',
+                    'raw_response' => $body,
+                ],
+            ], Response::HTTP_GATEWAY_TIMEOUT);
+        }
 
         if ($isNotFound) {
             return response()->json([
