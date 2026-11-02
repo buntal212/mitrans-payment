@@ -703,4 +703,66 @@ class MidtransGatewayTest extends TestCase
         $this->assertSame('expire', $payment->transaction_status);
         $this->assertNull($payment->paid_at);
     }
+
+    public function test_charge_and_query_parses_midtrans_expiry_time_from_wib_to_utc(): void
+    {
+        $merchant = Merchant::create([
+            'merchant_code' => 'wib-tz-merchant',
+            'merchant_name' => 'WIB Timezone Merchant',
+            'environment' => 'sandbox',
+            'is_active' => true,
+        ]);
+        $config = $merchant->configuration()->create(['is_active' => true]);
+        $config->setServerKeyAttribute('SB-Mid-server-tz123');
+        $config->save();
+
+        // 2026-11-02 22:02:43 in Asia/Jakarta is 2026-11-02 15:02:43 UTC
+        \Illuminate\Support\Facades\Http::fake([
+            'https://api.sandbox.midtrans.com/v2/charge' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '201',
+                'status_message' => 'QRIS transaction is created',
+                'transaction_id' => 'tx-wib-tz-001',
+                'order_id' => 'ORDER-WIB-TZ-001',
+                'gross_amount' => '50000.00',
+                'payment_type' => 'qris',
+                'transaction_status' => 'pending',
+                'expiry_time' => '2026-11-02 22:02:43',
+                'actions' => [
+                    [
+                        'name' => 'generate-qr-code',
+                        'method' => 'GET',
+                        'url' => 'https://api.sandbox.midtrans.com/v2/qris/tx-wib-tz-001/qr-code',
+                    ],
+                ],
+            ], 201),
+            'https://api.sandbox.midtrans.com/v2/ORDER-WIB-TZ-001/status' => \Illuminate\Support\Facades\Http::response([
+                'status_code' => '200',
+                'status_message' => 'Midtrans transaction is expired',
+                'transaction_id' => 'tx-wib-tz-001',
+                'order_id' => 'ORDER-WIB-TZ-001',
+                'gross_amount' => '50000.00',
+                'payment_type' => 'qris',
+                'transaction_status' => 'expire',
+                'expiry_time' => '2026-11-02 22:02:43',
+            ], 200),
+        ]);
+
+        $resCharge = $this->withToken($this->internalToken)
+            ->postJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/charge", [
+                'order_id' => 'ORDER-WIB-TZ-001',
+                'amount' => 50000,
+                'payment_type' => 'qris',
+            ]);
+
+        $resCharge->assertStatus(201)
+            ->assertJsonPath('data.expiry_time', '2026-11-02 22:02:43')
+            ->assertJsonPath('data.expires_at', '2026-11-02T15:02:43+00:00');
+
+        $resQuery = $this->withToken($this->internalToken)
+            ->getJson("/api/v1/internal/merchants/{$merchant->merchant_code}/sandbox-test/status/ORDER-WIB-TZ-001");
+
+        $resQuery->assertStatus(200)
+            ->assertJsonPath('data.expiry_time', '2026-11-02 22:02:43')
+            ->assertJsonPath('data.expires_at', '2026-11-02T15:02:43+00:00');
+    }
 }

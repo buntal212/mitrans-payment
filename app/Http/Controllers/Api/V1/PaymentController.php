@@ -7,6 +7,7 @@ use App\Models\Merchant;
 use App\Models\Payment;
 use App\Services\MidtransAuditService;
 use App\Services\MidtransCoreApiClient;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -257,6 +258,23 @@ class PaymentController extends Controller
         }
 
         $expiryTime = $payment->raw_response['expiry_time'] ?? ($payment->metadata['expiry_time'] ?? null);
+        $expiresAt = null;
+        if (! empty($expiryTime)) {
+            $rawExp = trim((string) $expiryTime);
+            if (preg_match('/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/', $rawExp)) {
+                $expiresAt = CarbonImmutable::createFromFormat('Y-m-d H:i:s', $rawExp, 'Asia/Jakarta')
+                    ->setTimezone('UTC')
+                    ->toIso8601String();
+            } elseif (str_contains($rawExp, 'T') || str_contains($rawExp, '+') || str_ends_with($rawExp, 'Z')) {
+                $expiresAt = CarbonImmutable::parse($rawExp)->setTimezone('UTC')->toIso8601String();
+            } else {
+                try {
+                    $expiresAt = CarbonImmutable::parse($rawExp, 'Asia/Jakarta')->setTimezone('UTC')->toIso8601String();
+                } catch (\Throwable) {
+                    $expiresAt = null;
+                }
+            }
+        }
 
         return [
             'id' => $payment->id,
@@ -274,7 +292,7 @@ class PaymentController extends Controller
             'qr_string' => $payment->qr_string,
             'qr_url' => $qrUrl,
             'expiry_time' => $expiryTime,
-            'expires_at' => $expiryTime,
+            'expires_at' => $expiresAt ?? $expiryTime,
             'va_numbers' => $payment->va_numbers,
             'permata_va_number' => $payment->raw_response['permata_va_number'] ?? null,
             'bill_key' => $payment->raw_response['bill_key'] ?? null,

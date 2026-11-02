@@ -9,8 +9,10 @@ use App\Models\MerchantConfiguration;
 use App\Models\Payment;
 use App\Services\MidtransAuditService;
 use App\Services\MidtransCoreApiClient;
+use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -446,6 +448,7 @@ class MidtransInternalMerchantController extends Controller
         $billKey = $body['bill_key'] ?? null;
         $billerCode = $body['biller_code'] ?? null;
         $expiryTime = $body['expiry_time'] ?? null;
+        $expiresAt = $this->parseMidtransExpiryToUtc($expiryTime);
 
         if (! empty($body['actions'])) {
             foreach ($body['actions'] as $action) {
@@ -498,7 +501,7 @@ class MidtransInternalMerchantController extends Controller
                     'bank' => $bank,
                     'qr_url' => $qrUrl,
                     'expiry_time' => $expiryTime,
-                    'expires_at' => $expiryTime,
+                    'expires_at' => $expiresAt ?? $expiryTime,
                     'permata_va_number' => $permataVaNumber,
                     'bill_key' => $billKey,
                     'biller_code' => $billerCode,
@@ -541,7 +544,7 @@ class MidtransInternalMerchantController extends Controller
                 'qr_url' => $qrUrl,
                 'checkout_url' => $checkoutUrl,
                 'expiry_time' => $expiryTime,
-                'expires_at' => $expiryTime,
+                'expires_at' => $expiresAt ?? $expiryTime,
                 'va_numbers' => $vaNumbers,
                 'permata_va_number' => $permataVaNumber,
                 'bill_key' => $billKey,
@@ -662,6 +665,7 @@ class MidtransInternalMerchantController extends Controller
         $checkoutUrl = $payment?->checkout_url ?? $qrUrl;
         $vaNumbers = $payment?->va_numbers ?? ($body['va_numbers'] ?? null);
         $expiryTime = $body['expiry_time'] ?? ($payment?->raw_response['expiry_time'] ?? ($payment?->metadata['expiry_time'] ?? null));
+        $expiresAt = $this->parseMidtransExpiryToUtc($expiryTime);
 
         return response()->json([
             'status' => $isSuccess ? 'success' : 'failed',
@@ -678,7 +682,7 @@ class MidtransInternalMerchantController extends Controller
                 'qr_url' => $qrUrl,
                 'checkout_url' => $checkoutUrl,
                 'expiry_time' => $expiryTime,
-                'expires_at' => $expiryTime,
+                'expires_at' => $expiresAt ?? $expiryTime,
                 'va_numbers' => $vaNumbers,
                 'permata_va_number' => $payment?->metadata['permata_va_number'] ?? ($body['permata_va_number'] ?? null),
                 'bill_key' => $payment?->metadata['bill_key'] ?? ($body['bill_key'] ?? null),
@@ -772,5 +776,30 @@ class MidtransInternalMerchantController extends Controller
             'created_at' => $merchant->created_at?->format('Y-m-d H:i:s'),
             'updated_at' => $merchant->updated_at?->format('Y-m-d H:i:s'),
         ];
+    }
+
+    private function parseMidtransExpiryToUtc(?string $rawExpiry): ?string
+    {
+        if (empty($rawExpiry)) {
+            return null;
+        }
+
+        $rawExpiry = trim($rawExpiry);
+
+        if (preg_match('/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/', $rawExpiry)) {
+            return CarbonImmutable::createFromFormat('Y-m-d H:i:s', $rawExpiry, 'Asia/Jakarta')
+                ->setTimezone('UTC')
+                ->toIso8601String();
+        }
+
+        if (str_contains($rawExpiry, 'T') || str_contains($rawExpiry, '+') || str_ends_with($rawExpiry, 'Z')) {
+            return CarbonImmutable::parse($rawExpiry)->setTimezone('UTC')->toIso8601String();
+        }
+
+        try {
+            return CarbonImmutable::parse($rawExpiry, 'Asia/Jakarta')->setTimezone('UTC')->toIso8601String();
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }
