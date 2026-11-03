@@ -49,6 +49,8 @@ class PaymentController extends Controller
             'payment_type' => ['nullable', 'string'],
             'bank' => ['nullable', 'string', 'in:bca,bni,bri,permata,mandiri'],
             'metadata' => ['nullable', 'array'],
+            'item_details' => ['nullable', 'array'],
+            'fee_breakdown' => ['nullable', 'array'],
         ]);
 
         $merchantCode = $validated['merchant_code'] ?? 'udev-central';
@@ -130,6 +132,10 @@ class PaymentController extends Controller
                 ];
             }
 
+            if (! empty($validated['item_details'])) {
+                $payload['item_details'] = $validated['item_details'];
+            }
+
             $res = $this->apiClient->charge($serverKey, $payload, $merchant->environment);
             $rawResponse = $res['body'] ?? [];
             $transactionId = $rawResponse['transaction_id'] ?? null;
@@ -189,7 +195,11 @@ class PaymentController extends Controller
                 'qr_string' => $qrString,
                 'va_numbers' => $vaNumbers,
                 'raw_response' => $rawResponse,
-                'metadata' => array_merge($validated['metadata'] ?? [], ['bank' => $bank, 'qr_url' => $qrUrl ?? null]),
+                'metadata' => array_merge($validated['metadata'] ?? [], [
+                    'bank' => $bank,
+                    'qr_url' => $qrUrl ?? null,
+                    'fee_breakdown' => $validated['fee_breakdown'] ?? ($validated['metadata']['fee_breakdown'] ?? null),
+                ]),
             ]
         );
 

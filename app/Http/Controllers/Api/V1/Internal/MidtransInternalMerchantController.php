@@ -309,6 +309,9 @@ class MidtransInternalMerchantController extends Controller
             'amount' => ['required', 'numeric', 'min:1000'],
             'payment_type' => ['nullable', 'string', 'in:qris,bank_transfer,echannel,gopay'],
             'bank' => ['nullable', 'string', 'in:bca,bni,bri,permata,mandiri'],
+            'item_details' => ['nullable', 'array'],
+            'fee_breakdown' => ['nullable', 'array'],
+            'metadata' => ['nullable', 'array'],
         ]);
 
         $orderId = ! empty($validated['order_id'])
@@ -417,6 +420,10 @@ class MidtransInternalMerchantController extends Controller
             ];
         }
 
+        if (! empty($validated['item_details'])) {
+            $payload['item_details'] = $validated['item_details'];
+        }
+
         $startTime = microtime(true);
         $result = $this->apiClient->charge($serverKey, $payload, $merchant->environment);
         $latencyMs = (int) round((microtime(true) - $startTime) * 1000);
@@ -505,6 +512,7 @@ class MidtransInternalMerchantController extends Controller
                     'permata_va_number' => $permataVaNumber,
                     'bill_key' => $billKey,
                     'biller_code' => $billerCode,
+                    'fee_breakdown' => $validated['fee_breakdown'] ?? ($validated['metadata']['fee_breakdown'] ?? null),
                 ],
             ]
         );
@@ -549,6 +557,7 @@ class MidtransInternalMerchantController extends Controller
                 'permata_va_number' => $permataVaNumber,
                 'bill_key' => $billKey,
                 'biller_code' => $billerCode,
+                'fee_breakdown' => $payment->metadata['fee_breakdown'] ?? null,
                 'raw_response' => $body,
                 'created_at' => $payment->created_at->format('Y-m-d H:i:s'),
             ],
