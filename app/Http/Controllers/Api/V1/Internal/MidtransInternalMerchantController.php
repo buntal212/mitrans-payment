@@ -14,6 +14,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\Response;
 
 class MidtransInternalMerchantController extends Controller
@@ -52,10 +53,30 @@ class MidtransInternalMerchantController extends Controller
         return response()->json(['data' => $data]);
     }
 
+    private function findMerchant(Request $request, string $merchantCode): Merchant
+    {
+        $environment = (string) ($request->input('environment') ?: $request->query('environment', ''));
+        $query = Merchant::query()->with('configuration')->where('merchant_code', $merchantCode);
+        if ($environment !== '') {
+            $query->where('environment', $environment);
+        }
+
+        return $query->firstOrFail();
+    }
+
     public function store(Request $request): JsonResponse
     {
+        $environment = (string) $request->input('environment', 'sandbox');
+        $environment = in_array($environment, ['sandbox', 'production'], true) ? $environment : 'sandbox';
+
         $validated = $request->validate([
-            'merchant_code' => ['required', 'string', 'max:60', 'regex:/^[a-z0-9_-]+$/', 'unique:merchants,merchant_code'],
+            'merchant_code' => [
+                'required',
+                'string',
+                'max:60',
+                'regex:/^[a-z0-9_-]+$/',
+                Rule::unique('merchants', 'merchant_code')->where('environment', $environment),
+            ],
             'merchant_name' => ['required', 'string', 'max:100'],
             'environment' => ['nullable', 'string', 'in:sandbox,production'],
             'is_active' => ['nullable', 'boolean'],
@@ -64,7 +85,7 @@ class MidtransInternalMerchantController extends Controller
         $merchant = Merchant::create([
             'merchant_code' => $validated['merchant_code'],
             'merchant_name' => $validated['merchant_name'],
-            'environment' => $validated['environment'] ?? 'sandbox',
+            'environment' => $environment,
             'is_active' => $validated['is_active'] ?? true,
         ]);
 
@@ -77,7 +98,7 @@ class MidtransInternalMerchantController extends Controller
             action: 'merchant.provisioned',
             status: 'success',
             merchant: $merchant,
-            metadata: ['merchant_code' => $merchant->merchant_code, 'merchant_name' => $merchant->merchant_name]
+            metadata: ['merchant_code' => $merchant->merchant_code, 'merchant_name' => $merchant->merchant_name, 'environment' => $environment]
         );
 
         return response()->json([
@@ -87,18 +108,16 @@ class MidtransInternalMerchantController extends Controller
         ], Response::HTTP_CREATED);
     }
 
-    public function show(string $merchantCode): JsonResponse
+    public function show(Request $request, string $merchantCode): JsonResponse
     {
-        $merchant = Merchant::query()->with('configuration')
-            ->where('merchant_code', $merchantCode)
-            ->firstOrFail();
+        $merchant = $this->findMerchant($request, $merchantCode);
 
         return response()->json(['data' => $this->transformMerchant($merchant)]);
     }
 
     public function update(Request $request, string $merchantCode): JsonResponse
     {
-        $merchant = Merchant::query()->where('merchant_code', $merchantCode)->firstOrFail();
+        $merchant = $this->findMerchant($request, $merchantCode);
 
         $validated = $request->validate([
             'merchant_name' => ['sometimes', 'required', 'string', 'max:100'],
@@ -121,11 +140,9 @@ class MidtransInternalMerchantController extends Controller
         ]);
     }
 
-    public function readiness(string $merchantCode): JsonResponse
+    public function readiness(Request $request, string $merchantCode): JsonResponse
     {
-        $merchant = Merchant::query()->with('configuration')
-            ->where('merchant_code', $merchantCode)
-            ->firstOrFail();
+        $merchant = $this->findMerchant($request, $merchantCode);
 
         $config = $merchant->configuration;
         $hasServerKey = ! empty($config?->encrypted_server_key);
@@ -152,11 +169,9 @@ class MidtransInternalMerchantController extends Controller
         ]);
     }
 
-    public function getConfiguration(string $merchantCode): JsonResponse
+    public function getConfiguration(Request $request, string $merchantCode): JsonResponse
     {
-        $merchant = Merchant::query()->with('configuration')
-            ->where('merchant_code', $merchantCode)
-            ->firstOrFail();
+        $merchant = $this->findMerchant($request, $merchantCode);
 
         $config = $merchant->configuration;
 
@@ -179,7 +194,7 @@ class MidtransInternalMerchantController extends Controller
 
     public function updateConfiguration(Request $request, string $merchantCode): JsonResponse
     {
-        $merchant = Merchant::query()->where('merchant_code', $merchantCode)->firstOrFail();
+        $merchant = $this->findMerchant($request, $merchantCode);
 
         $validated = $request->validate([
             'midtrans_merchant_id' => ['nullable', 'string', 'max:100'],
@@ -215,6 +230,7 @@ class MidtransInternalMerchantController extends Controller
             merchant: $merchant,
             metadata: [
                 'merchant_code' => $merchant->merchant_code,
+                'environment' => $merchant->environment,
                 'has_server_key' => ! empty($config->encrypted_server_key),
                 'has_client_key' => ! empty($config->client_key),
             ]
@@ -225,6 +241,7 @@ class MidtransInternalMerchantController extends Controller
             'message' => 'Konfigurasi API Midtrans berhasil disimpan terenkripsi.',
             'data' => [
                 'merchant_code' => $merchant->merchant_code,
+                'environment' => $merchant->environment,
                 'midtrans_merchant_id' => $config->midtrans_merchant_id,
                 'client_key' => $config->client_key,
                 'masked_server_key' => $config->masked_server_key,
@@ -238,9 +255,7 @@ class MidtransInternalMerchantController extends Controller
 
     public function testConnection(Request $request, string $merchantCode): JsonResponse
     {
-        $merchant = Merchant::query()->with('configuration')
-            ->where('merchant_code', $merchantCode)
-            ->firstOrFail();
+        $merchant = $this->findMerchant($request, $merchantCode);
 
         $config = $merchant->configuration;
         $serverKey = $config?->getServerKey();
@@ -264,17 +279,18 @@ class MidtransInternalMerchantController extends Controller
         $isAuthValid = ($statusCode === 404 || $statusCode === 200);
 
         $status = $isAuthValid ? 'success' : 'failed';
+        $envLabel = ucfirst($merchant->environment);
         $message = $isAuthValid
-            ? 'Koneksi ke Midtrans Core API Sandbox berhasil. Kredensial valid.'
-            : ($result['body']['status_message'] ?? 'Otentikasi ke Midtrans gagal. Periksa Server Key Anda.');
+            ? "Koneksi ke Midtrans Core API {$envLabel} berhasil. Kredensial valid."
+            : ($result['body']['status_message'] ?? "Otentikasi ke Midtrans {$envLabel} gagal. Periksa Server Key Anda.");
 
         $this->auditService->record(
-            action: 'sandbox.connection_tested',
+            action: 'connection_tested',
             status: $status,
             merchant: $merchant,
             responseCode: (string) $statusCode,
             latencyMs: $latencyMs,
-            metadata: ['result_code' => $statusCode, 'latency_ms' => $latencyMs]
+            metadata: ['result_code' => $statusCode, 'latency_ms' => $latencyMs, 'environment' => $merchant->environment]
         );
 
         return response()->json([
@@ -290,9 +306,7 @@ class MidtransInternalMerchantController extends Controller
 
     public function createSandboxPayment(Request $request, string $merchantCode): JsonResponse
     {
-        $merchant = Merchant::query()->with('configuration')
-            ->where('merchant_code', $merchantCode)
-            ->firstOrFail();
+        $merchant = $this->findMerchant($request, $merchantCode);
 
         $config = $merchant->configuration;
         $serverKey = $config?->getServerKey();
